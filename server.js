@@ -4,7 +4,7 @@ import path from "path";
 import fs from "fs";
 
 const TOKEN = process.env.DEPLOY_TOKEN;
-const HOST = "192.168.0.41";
+const HOST = process.env.IP_ADDRESS;
 const PORT = 4040;
 
 if (!TOKEN) {
@@ -92,7 +92,7 @@ const server = http.createServer((req, res) => {
     });
 
     child.stderr.on("data", (data) => {
-        process.stderr.write(`[${repo}] ${data}`);
+      process.stderr.write(`[${repo}] ${data}`);
     });
 
     child.on("exit", (code) => {
