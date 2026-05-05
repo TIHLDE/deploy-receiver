@@ -1,297 +1,117 @@
-"use strict";
+import http from "http";
+import { execFile } from "child_process";
+import path from "path";
+import fs from "fs";
 
-const express = require("express");
-const { spawn } = require("child_process");
-const path = require("path");
-const fs = require("fs");
-const crypto = require("crypto");
-const { loadConfig } = require("./config");
+const TOKEN = process.env.DEPLOY_TOKEN;
+const HOST = "192.168.0.41";
+const PORT = 4040;
 
-// ---------------------------------------------------------------------------
-// Validation patterns
-// ---------------------------------------------------------------------------
-/** Repo slug: letters, digits, dot, underscore, dash.  1-128 chars. */
-const REPO_SLUG_RE = /^[a-zA-Z0-9._-]{1,128}$/;
-
-/** Image ref: must start with ghcr.io/ and contain only safe chars. */
-const IMAGE_RE = /^ghcr\.io\/[a-z0-9._/-]{1,256}$/;
-
-/** Tag: alphanumeric, dash, dot, underscore.  1-128 chars. */
-const TAG_RE = /^[a-zA-Z0-9._-]{1,128}$/;
-
-/** Allowed environment values. */
-const ENVS = new Set(["prod", "dev", ""]);
-
-// ---------------------------------------------------------------------------
-// Per-repo deploy lock (in-memory)
-// ---------------------------------------------------------------------------
-const deployLocks = new Map();
-
-function acquireLock(repo) {
-  if (deployLocks.get(repo)) return false;
-  deployLocks.set(repo, true);
-  return true;
-}
-
-function releaseLock(repo) {
-  deployLocks.delete(repo);
-}
-
-// ---------------------------------------------------------------------------
-// Tail helper — keep last N characters of a string
-// ---------------------------------------------------------------------------
-function tail(str, maxChars) {
-  if (!str) return "";
-  return str.length > maxChars ? str.slice(-maxChars) : str;
-}
-
-// ---------------------------------------------------------------------------
-// Boot
-// ---------------------------------------------------------------------------
-let config;
-try {
-  config = loadConfig();
-} catch (err) {
-  console.error(`[FATAL] ${err.message}`);
+if (!TOKEN) {
+  console.error("DEPLOY_TOKEN is not set. Exiting.");
   process.exit(1);
 }
 
-const app = express();
-app.use(express.json({ limit: "16kb" }));
+const running = new Set();
 
-// Simple request logger (no secrets)
-app.use((req, _res, next) => {
-  console.log(`[${new Date().toISOString()}] ${req.method} ${req.url}`);
-  next();
-});
+/**
+ * Simple structured logger
+ */
+function log(repo, message, meta = "") {
+  const time = new Date().toISOString();
+  if (meta && typeof meta === "object") {
+    console.log(`[${time}] [${repo}] ${message}`, JSON.stringify(meta));
+  } else {
+    console.log(`[${time}] [${repo}] ${message}`, meta);
+  }
+}
 
-// ---------------------------------------------------------------------------
-// Health check
-// ---------------------------------------------------------------------------
-app.get("/health", (_req, res) => {
-  res.json({ ok: true, uptime: process.uptime() });
-});
+const server = http.createServer((req, res) => {
+  log("system", `Incoming request ${req.method} ${req.url}`);
 
-// ---------------------------------------------------------------------------
-// Deploy endpoint
-// ---------------------------------------------------------------------------
-app.post("/deploy", async (req, res) => {
-  // --- Auth ---
-  const token = req.headers["x-deploy-token"];
-  if (
-    !token ||
-    !timingSafeEqual(token, config.secrets.deployReceiverToken)
-  ) {
-    return res.status(401).json({ ok: false, error: "Unauthorized" });
+  if (req.method !== "POST" || req.url !== "/deploy") {
+    res.writeHead(404).end();
+    return;
   }
 
-  // --- Parse body ---
-  const { repo, image, tag, environment, deliveryId } = req.body || {};
-
-  if (!repo || !image || !tag) {
-    return res
-      .status(400)
-      .json({ ok: false, error: "Missing required fields: repo, image, tag" });
+  if (req.headers["x-deploy-token"] !== TOKEN) {
+    log("system", "Unauthorized request rejected");
+    res.writeHead(401).end(JSON.stringify({ ok: false, error: "Unauthorized" }));
+    return;
   }
 
-  // --- Validate repo slug ---
-  if (!REPO_SLUG_RE.test(repo)) {
-    return res
-      .status(400)
-      .json({ ok: false, error: "Invalid repo slug format" });
-  }
+  let body = "";
 
-  // --- Allowlist ---
-  if (config.allowlist && !config.allowlist.includes(repo)) {
-    return res
-      .status(403)
-      .json({ ok: false, error: "Repo not in allowlist" });
-  }
+  req.on("data", (chunk) => (body += chunk));
 
-  // --- Validate image ---
-  if (!IMAGE_RE.test(image)) {
-    return res
-      .status(400)
-      .json({ ok: false, error: "Invalid image format (must be ghcr.io/…)" });
-  }
+  req.on("end", () => {
+    let payload;
 
-  // --- Validate tag ---
-  if (!TAG_RE.test(tag)) {
-    return res.status(400).json({ ok: false, error: "Invalid tag format" });
-  }
-
-  // --- Validate environment ---
-  const env = environment || "";
-  if (!ENVS.has(env)) {
-    return res
-      .status(400)
-      .json({ ok: false, error: "Invalid environment value" });
-  }
-
-  // --- Resolve paths ---
-  const repoDir = path.join(config.appsRoot, repo);
-  const deployScript = path.join(repoDir, "deploy.sh");
-
-  if (!fs.existsSync(repoDir) || !fs.statSync(repoDir).isDirectory()) {
-    return res
-      .status(404)
-      .json({ ok: false, error: `Repo directory not found: ${repoDir}` });
-  }
-
-  if (!fs.existsSync(deployScript)) {
-    return res
-      .status(404)
-      .json({ ok: false, error: `deploy.sh not found in ${repoDir}` });
-  }
-
-  try {
-    fs.accessSync(deployScript, fs.constants.X_OK);
-  } catch {
-    return res
-      .status(500)
-      .json({ ok: false, error: `deploy.sh is not executable` });
-  }
-
-  // --- Per-repo lock ---
-  if (!acquireLock(repo)) {
-    return res
-      .status(409)
-      .json({ ok: false, error: `Deploy already in progress for ${repo}` });
-  }
-
-  const reqId = deliveryId || crypto.randomUUID();
-  console.log(
-    `[deploy] ${reqId} | repo=${repo} image=${image} tag=${tag} env=${env}`
-  );
-
-  // --- Execute deploy.sh ---
-  try {
-    const result = await runDeploy({
-      deployScript,
-      repoDir,
-      repo,
-      image,
-      tag,
-      env,
-      reqId,
-    });
-
-    console.log(
-      `[deploy] ${reqId} | finished exitCode=${result.exitCode}`
-    );
-
-    if (result.exitCode === 0) {
-      return res.json({
-        ok: true,
-        repo,
-        image,
-        tag,
-        output: tail(result.stdout, config.maxOutputChars),
-      });
-    } else {
-      return res.status(500).json({
-        ok: false,
-        repo,
-        image,
-        tag,
-        error: tail((result.stderr || "") + (result.stdout || ""), config.maxOutputChars),
-      });
+    try {
+      payload = JSON.parse(body);
+    } catch (err) {
+      log("system", "Invalid JSON received", body);
+      res.writeHead(400).end(JSON.stringify({ ok: false, error: "Invalid JSON" }));
+      return;
     }
-  } catch (err) {
-    console.error(`[deploy] ${reqId} | error: ${err.message}`);
-    return res
-      .status(500)
-      .json({ ok: false, repo, image, tag, error: err.message });
-  } finally {
-    releaseLock(repo);
-  }
-});
 
-// ---------------------------------------------------------------------------
-// Execute deploy.sh as a child process
-// ---------------------------------------------------------------------------
-function runDeploy({ deployScript, repoDir, repo, image, tag, env, reqId }) {
-  return new Promise((resolve, reject) => {
-    let stdout = "";
-    let stderr = "";
+    const { repo, image, deliveryId } = payload;
 
-    const child = spawn("/bin/bash", [deployScript], {
-      cwd: repoDir,
-      env: {
-        // Minimal safe PATH
-        PATH: "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-        HOME: repoDir,
+    if (!repo || !image || !deliveryId) {
+      log(repo || "system", "Missing required fields", payload);
+      res.writeHead(400).end(JSON.stringify({ ok: false, error: "Missing fields" }));
+      return;
+    }
 
-        // Deploy metadata
-        DEPLOY_REPO: repo,
-        DEPLOY_IMAGE: image,
-        DEPLOY_TAG: tag,
-        DEPLOY_ENV: env,
+    const script = `/home/debian/apps/${repo}/deploy.sh`;
 
-        // Bitwarden CLI state directory
-        BITWARDENCLI_APPDATA_DIR:
-          process.env.BITWARDENCLI_APPDATA_DIR ||
-          path.join(config.appsRoot, ".bw-cli"),
+    if (!fs.existsSync(script)) {
+      log(repo, `Deploy script not found at ${script}`);
+      res.writeHead(404).end(JSON.stringify({ ok: false, error: "Deploy script not found" }));
+      return;
+    }
 
-        // Secrets (named to match existing deploy.sh conventions)
-        VAULTWARDEN_MASTER_PASSWORD: config.secrets.vaultwardenMasterPassword,
-        GHCR_PAT: config.secrets.ghcrPat,
-        GHCR_TOKEN: config.secrets.ghcrPat, // optional: keep for backwards compatibility
-      },
-      stdio: ["ignore", "pipe", "pipe"],
-      timeout: config.deployTimeoutMs,
+    if (running.has(repo)) {
+      log(repo, "Deploy skipped (already running)", { deliveryId });
+      res.writeHead(409).end(JSON.stringify({ ok: false, error: "Deploy already in progress" }));
+      return;
+    }
+
+    running.add(repo);
+
+    log(repo, "Deploy accepted", { image, deliveryId, script });
+
+    res.writeHead(200).end(JSON.stringify({ ok: true }));
+
+    const child = execFile(script, [image, deliveryId], {
+      cwd: path.dirname(script),
     });
 
     child.stdout.on("data", (data) => {
-      stdout += data.toString();
+      process.stdout.write(`[${repo}] ${data}`);
     });
 
     child.stderr.on("data", (data) => {
-      stderr += data.toString();
+        process.stderr.write(`[${repo}] ${data}`);
+    });
+
+    child.on("exit", (code) => {
+      running.delete(repo);
+
+      if (code === 0) {
+        log(repo, "Deploy finished successfully", { deliveryId });
+      } else {
+        log(repo, "Deploy failed", { code, deliveryId });
+      }
     });
 
     child.on("error", (err) => {
-      reject(err);
+      running.delete(repo);
+      log(repo, "Failed to start deploy process", err.message);
     });
-
-    child.on("close", (exitCode) => {
-      resolve({ exitCode, stdout, stderr });
-    });
-
-    // Manual timeout kill in case spawn timeout doesn't work on all platforms
-    const timer = setTimeout(() => {
-      try {
-        child.kill("SIGTERM");
-      } catch {
-        /* already dead */
-      }
-      setTimeout(() => {
-        try {
-          child.kill("SIGKILL");
-        } catch {
-          /* already dead */
-        }
-      }, 5000);
-    }, config.deployTimeoutMs);
-
-    child.on("close", () => clearTimeout(timer));
   });
-}
+});
 
-// ---------------------------------------------------------------------------
-// Timing-safe string comparison
-// ---------------------------------------------------------------------------
-function timingSafeEqual(a, b) {
-  if (typeof a !== "string" || typeof b !== "string") return false;
-  const bufA = Buffer.from(a);
-  const bufB = Buffer.from(b);
-  if (bufA.length !== bufB.length) return false;
-  return crypto.timingSafeEqual(bufA, bufB);
-}
-
-// ---------------------------------------------------------------------------
-// Start
-// ---------------------------------------------------------------------------
-app.listen(config.port, config.ipAddress, () => {
-  console.log(`[deploy-receiver] Listening on ${config.ipAddress}:${config.port}`);
+server.listen(PORT, HOST, () => {
+  console.log(`Deploy server listening on ${HOST}:${PORT}`);
 });
