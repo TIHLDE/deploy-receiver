@@ -4,7 +4,6 @@ import path from "path";
 import fs from "fs";
 
 const TOKEN = process.env.DEPLOY_TOKEN;
-const HOST = process.env.IP_ADDRESS;
 const PORT = 4040;
 
 if (!TOKEN) {
@@ -112,6 +111,6 @@ const server = http.createServer((req, res) => {
   });
 });
 
-server.listen(PORT, HOST, () => {
-  console.log(`Deploy server listening on ${HOST}:${PORT}`);
+server.listen(PORT, "0.0.0.0", () => {
+  console.log(`Deploy server listening on port ${PORT}`);
 });
