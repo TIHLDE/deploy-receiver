@@ -27,6 +27,10 @@ The HTTP server (`server.js`) needs a *DEPLOY_TOKEN* environment variable. This 
 ```env
 DEPLOY_TOKEN=my-top-secret-deploy-token-that-can-be-found-on-vaultwarden
 ```
+
+Deploy scripts are limited to 15 minutes by default. Set `DEPLOY_TIMEOUT_MS` in `.env` to
+override this limit, for example `DEPLOY_TIMEOUT_MS=1800000` for 30 minutes. A timed-out
+deploy is terminated and its per-repository lock is released so later deploy requests can run.
 - Create a systemd service by creating a symlink in `/etc/systemd/system` that points to `deploy-receiver.service`.
 ```bash
 sudo ln -s /etc/systemd/system/deploy-receiver.service /home/debian/deploy-receiver/deploy-receiver.service
@@ -46,7 +50,10 @@ Useful commands:
 # Check if everything is looking good
 sudo systemctl status deploy-receiver.service
 
-# Restart the receiver, for example after you make changes
+# Reload systemd only when the service file itself has changed
+sudo systemctl daemon-reload
+
+# Restart the receiver after updating server.js or its environment
 sudo systemctl restart deploy-receiver.service
 
 # Check logs (make sure you scroll to the bottom by pressing SHIFT+G)
