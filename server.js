@@ -5,6 +5,11 @@ import fs from "fs";
 
 const TOKEN = process.env.DEPLOY_TOKEN;
 const PORT = 4040;
+const DEFAULT_DEPLOY_TIMEOUT_MS = 15 * 60 * 1000;
+const configuredTimeout = Number.parseInt(process.env.DEPLOY_TIMEOUT_MS ?? "", 10);
+const DEPLOY_TIMEOUT_MS = Number.isFinite(configuredTimeout) && configuredTimeout > 0
+  ? configuredTimeout
+  : DEFAULT_DEPLOY_TIMEOUT_MS;
 
 if (!TOKEN) {
   console.error("DEPLOY_TOKEN is not set. Exiting.");
@@ -84,7 +89,42 @@ const server = http.createServer((req, res) => {
 
     const child = execFile(script, [image, deliveryId], {
       cwd: path.dirname(script),
+      detached: true,
     });
+
+    let timeout;
+    let forceKillTimeout;
+    let finished = false;
+
+    const finishDeploy = () => {
+      if (finished) {
+        return;
+      }
+
+      finished = true;
+      clearTimeout(timeout);
+      clearTimeout(forceKillTimeout);
+      running.delete(repo);
+    };
+
+    const terminateProcessGroup = (signal) => {
+      try {
+        process.kill(-child.pid, signal);
+      } catch (err) {
+        if (err.code !== "ESRCH") {
+          log(repo, "Failed to terminate deploy process", err.message);
+        }
+      }
+    };
+
+    timeout = setTimeout(() => {
+      log(repo, "Deploy timed out; terminating process", {
+        deliveryId,
+        timeoutMs: DEPLOY_TIMEOUT_MS,
+      });
+      terminateProcessGroup("SIGTERM");
+      forceKillTimeout = setTimeout(() => terminateProcessGroup("SIGKILL"), 10_000);
+    }, DEPLOY_TIMEOUT_MS);
 
     child.stdout.on("data", (data) => {
       process.stdout.write(`[${repo}] ${data}`);
@@ -95,7 +135,7 @@ const server = http.createServer((req, res) => {
     });
 
     child.on("exit", (code) => {
-      running.delete(repo);
+      finishDeploy();
 
       if (code === 0) {
         log(repo, "Deploy finished successfully", { deliveryId });
@@ -105,7 +145,7 @@ const server = http.createServer((req, res) => {
     });
 
     child.on("error", (err) => {
-      running.delete(repo);
+      finishDeploy();
       log(repo, "Failed to start deploy process", err.message);
     });
   });
